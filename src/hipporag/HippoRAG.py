@@ -1404,6 +1404,21 @@ class HippoRAG:
         assert np.count_nonzero(all_phrase_weights) == len(linking_score_map.keys())
         return all_phrase_weights, linking_score_map
 
+    """Helper function(for damping)"""
+    def get_damping_for_query(self, query: str, top_k_facts) -> float:
+
+      num_tokens = len(query.split())
+      num_facts = len(top_k_facts)
+      # - 짧고 단순한 질문: 그래프 많이 안 타도 되니까 damping 낮게
+      # - 길고 복잡/멀티홉일 것 같은 질문: damping 높게
+      if num_tokens <= 8 and num_facts <= 3:
+          return 0.3
+      elif num_tokens <= 16:
+          return 0.5
+      else:
+          return 0.7
+
+
     def graph_search_with_fact_entities(self, query: str,
                                         link_top_k: int,
                                         query_fact_scores: np.ndarray,
@@ -1506,10 +1521,19 @@ class HippoRAG:
 
         assert sum(node_weights) > 0, f'No phrases found in the graph for the given facts: {top_k_facts}'
 
+        """수정: Dynamically set the damping value depending on the query/fact"""
+        damping = self.get_damping_for_query(query, top_k_facts)
+
         #Running PPR algorithm based on the passage and phrase weights previously assigned
         ppr_start = time.time()
-        ppr_sorted_doc_ids, ppr_sorted_doc_scores = self.run_ppr(node_weights, damping=self.global_config.damping)
+        ppr_sorted_doc_ids, ppr_sorted_doc_scores = self.run_ppr(
+            reset_prob=node_weights,
+            damping=damping,
+            passage_node_weight=passage_node_weight,  # 🔹 여기 추가
+        )
         ppr_end = time.time()
+
+
 
         self.ppr_time += (ppr_end - ppr_start)
 
@@ -1569,33 +1593,22 @@ class HippoRAG:
             logger.error(f"Error in rerank_facts: {str(e)}")
             return [], [], {'facts_before_rerank': [], 'facts_after_rerank': [], 'error': str(e)}
     
+    """add node weight"""
     def run_ppr(self,
                 reset_prob: np.ndarray,
-                damping: float =0.5) -> Tuple[np.ndarray, np.ndarray]:
+                damping: float = 0.5,
+                passage_node_weight: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
         """
         Runs Personalized PageRank (PPR) on a graph and computes relevance scores for
         nodes corresponding to document passages. The method utilizes a damping
         factor for teleportation during rank computation and can take a reset
         probability array to influence the starting state of the computation.
-
-        Parameters:
-            reset_prob (np.ndarray): A 1-dimensional array specifying the reset
-                probability distribution for each node. The array must have a size
-                equal to the number of nodes in the graph. NaNs or negative values
-                within the array are replaced with zeros.
-            damping (float): A scalar specifying the damping factor for the
-                computation. Defaults to 0.5 if not provided or set to `None`.
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: A tuple containing two numpy arrays. The
-                first array represents the sorted node IDs of document passages based
-                on their relevance scores in descending order. The second array
-                contains the corresponding relevance scores of each document passage
-                in the same order.
         """
 
-        if damping is None: damping = 0.5 # for potential compatibility
+        if damping is None:
+            damping = 0.5  # for potential compatibility
         reset_prob = np.where(np.isnan(reset_prob) | (reset_prob < 0), 0, reset_prob)
+
         pagerank_scores = self.graph.personalized_pagerank(
             vertices=range(len(self.node_name_to_vertex_idx)),
             damping=damping,
@@ -1605,7 +1618,28 @@ class HippoRAG:
             implementation='prpack'
         )
 
-        doc_scores = np.array([pagerank_scores[idx] for idx in self.passage_node_idxs])
+        # Apply weights based on node type
+        pagerank_scores = np.array(pagerank_scores)
+
+        if "node_type" in self.graph.vs.attribute_names():
+            node_types = np.array(self.graph.vs["node_type"])
+
+            # 타입별 weight 테이블
+            type_weight_map = {
+                "entity": 1.0,
+                "fact": 0.7,
+                "passage": passage_node_weight,  # 인자로 받은 passage weight 재사용
+            }
+
+            weighted_scores = np.zeros_like(pagerank_scores, dtype=float)
+            for t, w in type_weight_map.items():
+                mask = (node_types == t)
+                if np.any(mask):
+                    weighted_scores[mask] = pagerank_scores[mask] * w
+        else:
+            weighted_scores = pagerank_scores
+
+        doc_scores = np.array([weighted_scores[idx] for idx in self.passage_node_idxs])
         sorted_doc_ids = np.argsort(doc_scores)[::-1]
         sorted_doc_scores = doc_scores[sorted_doc_ids.tolist()]
 
