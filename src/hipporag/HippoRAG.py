@@ -1409,8 +1409,8 @@ class HippoRAG:
 
       num_tokens = len(query.split())
       num_facts = len(top_k_facts)
-      # - 짧고 단순한 질문: 그래프 많이 안 타도 되니까 damping 낮게
-      # - 길고 복잡/멀티홉일 것 같은 질문: damping 높게
+      # - Short and simpler query: low damping
+      # - complex/multi-hop possible query: high damping
       if num_tokens <= 8 and num_facts <= 3:
           return 0.3
       elif num_tokens <= 16:
@@ -1521,7 +1521,7 @@ class HippoRAG:
 
         assert sum(node_weights) > 0, f'No phrases found in the graph for the given facts: {top_k_facts}'
 
-        """수정: Dynamically set the damping value depending on the query/fact"""
+        """Dynamically set the damping value depending on the query/fact"""
         damping = self.get_damping_for_query(query, top_k_facts)
 
         #Running PPR algorithm based on the passage and phrase weights previously assigned
@@ -1624,11 +1624,11 @@ class HippoRAG:
         if "node_type" in self.graph.vs.attribute_names():
             node_types = np.array(self.graph.vs["node_type"])
 
-            # 타입별 weight 테이블
+            # weight tables per type
             type_weight_map = {
                 "entity": 1.0,
                 "fact": 0.7,
-                "passage": passage_node_weight,  # 인자로 받은 passage weight 재사용
+                "passage": passage_node_weight,  # reuse passage weight
             }
 
             weighted_scores = np.zeros_like(pagerank_scores, dtype=float)
